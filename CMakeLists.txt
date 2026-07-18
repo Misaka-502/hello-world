@@ -32,10 +32,26 @@ set(CMAKE_AUTORCC ON)
 set(SOURCES
     src/main.cpp
     src/mainwindow.cpp
+    src/track.cpp
+    src/playlist.cpp
+    src/library.cpp
+    src/player.cpp
+    src/lrcparser.cpp
+    src/lyricswidget.cpp
+    src/transcoder.cpp
+    src/playmodestrategy.cpp
 )
 
 set(HEADERS
     src/mainwindow.h
+    src/track.h
+    src/playlist.h
+    src/library.h
+    src/player.h
+    src/lrcparser.h
+    src/lyricswidget.h
+    src/transcoder.h
+    src/playmodestrategy.h
 )
 
 # ============================================================
