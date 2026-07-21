@@ -14,9 +14,15 @@
 #include <QFileDialog>
 #include <QDirIterator>
 #include <QFileInfo>
+#include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
+#include <QInputDialog>
+#include <QMenu>
 #include <QMessageBox>
 #include <QMediaPlayer>
 #include <QMediaMetaData>
+#include <QSettings>
 #include <QStandardPaths>
 #include <QJsonDocument>
 #include <QJsonArray>
@@ -28,6 +34,8 @@
 #include "lrcparser.h"
 #include "lyricswidget.h"
 #include "transcoder.h"
+#include "playlistmanager.h"
+#include "spectrumwidget.h"
 
 // ============================================================
 // Constructor / Destructor
@@ -40,17 +48,28 @@ MainWindow::MainWindow(QWidget *parent)
     // Create core components
     m_player = new Player(this);
     m_playlist = new Playlist(this);
+    m_playlistManager = new PlaylistManager(this);
     m_library = new Library(this);
     m_lrcParser = new LrcParser();
 
     setupUI();
-    applyStylesheet();
+
+    // Load theme preference (defaults to light)
+    QSettings settings;
+    m_darkTheme = settings.value("theme/dark", false).toBool();
+    applyTheme();
 
     // Load persisted library
     QList<Track> savedTracks = m_library->loadLibrary();
     if (!savedTracks.isEmpty()) {
         m_playlist->setTracks(savedTracks);
         refreshPlaylistWidget();
+        // Populate playlist combo
+        m_playlistCombo->addItem("All Tracks");
+        QStringList names = m_playlistManager->playlistNames();
+        for (const auto &name : names)
+            m_playlistCombo->addItem(name);
+        m_playlistCombo->setCurrentIndex(0);
         statusBar()->showMessage(
             QString("Loaded %1 tracks from library").arg(savedTracks.size()), 3000);
     }
@@ -62,6 +81,22 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onPlaylistChanged);
     connect(m_playlist, &Playlist::playModeChanged,
             this, &MainWindow::onPlayModeChanged);
+
+    // Playlist manager signals
+    connect(m_playlistManager, &PlaylistManager::playlistsChanged,
+            this, [this]() {
+                // Refresh combo box without losing selection
+                QString current = m_playlistCombo->currentText();
+                m_playlistCombo->blockSignals(true);
+                m_playlistCombo->clear();
+                m_playlistCombo->addItem("All Tracks");
+                QStringList names = m_playlistManager->playlistNames();
+                for (const auto &name : names)
+                    m_playlistCombo->addItem(name);
+                int idx = m_playlistCombo->findText(current);
+                m_playlistCombo->setCurrentIndex(idx >= 0 ? idx : 0);
+                m_playlistCombo->blockSignals(false);
+            });
 
     // Player signals
     connect(m_player, &Player::positionChanged,
@@ -90,6 +125,12 @@ MainWindow::MainWindow(QWidget *parent)
             this, &MainWindow::onLyricsJumpRequested);
     connect(m_lyricsWidget, &LyricsWidget::browsingStateChanged,
             this, &MainWindow::onLyricsBrowsingChanged);
+
+    // Spectrum — update playhead on position change
+    connect(m_player, &Player::positionChanged,
+            this, [this](qint64 pos) {
+                m_spectrumWidget->updatePosition(pos, m_player->duration());
+            });
 
     // Progress slider
     connect(m_progressSlider, &QSlider::sliderPressed,
@@ -162,9 +203,48 @@ void MainWindow::setupLeftPanel(QWidget *parent, QHBoxLayout *mainLayout)
     layout->setContentsMargins(6, 18, 6, 6);
     layout->setSpacing(4);
 
+    // --- Playlist selector (combo + buttons) ---
+    QWidget *selectorRow = new QWidget(parent);
+    QHBoxLayout *selLayout = new QHBoxLayout(selectorRow);
+    selLayout->setContentsMargins(0, 0, 0, 0);
+    selLayout->setSpacing(4);
+
+    m_playlistCombo = new QComboBox(parent);
+    m_playlistCombo->setObjectName("playlistCombo");
+    m_playlistCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+    m_playlistCombo->addItem("All Tracks");
+    m_playlistCombo->view()->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_playlistCombo->view(), &QWidget::customContextMenuRequested,
+            this, &MainWindow::onPlaylistComboContextMenu);
+    connect(m_playlistCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &MainWindow::onPlaylistComboChanged);
+    selLayout->addWidget(m_playlistCombo);
+
+    m_newPlaylistBtn = new QPushButton("+", parent);
+    m_newPlaylistBtn->setFixedSize(28, 28);
+    m_newPlaylistBtn->setObjectName("miniBtn");
+    m_newPlaylistBtn->setToolTip("New Playlist");
+    connect(m_newPlaylistBtn, &QPushButton::clicked,
+            this, &MainWindow::onNewPlaylist);
+    selLayout->addWidget(m_newPlaylistBtn);
+
+    m_autoGenBtn = new QPushButton("Auto", parent);
+    m_autoGenBtn->setFixedHeight(28);
+    m_autoGenBtn->setObjectName("miniBtn");
+    m_autoGenBtn->setToolTip("Auto-generate playlists");
+    connect(m_autoGenBtn, &QPushButton::clicked,
+            this, &MainWindow::onAutoGenerate);
+    selLayout->addWidget(m_autoGenBtn);
+
+    layout->addWidget(selectorRow);
+
+    // --- Playlist list ---
     m_playlistWidget = new QListWidget(parent);
     m_playlistWidget->setSelectionMode(QAbstractItemView::SingleSelection);
     m_playlistWidget->setObjectName("playlistList");
+    m_playlistWidget->setContextMenuPolicy(Qt::CustomContextMenu);
+    connect(m_playlistWidget, &QListWidget::customContextMenuRequested,
+            this, &MainWindow::onPlaylistContextMenu);
     layout->addWidget(m_playlistWidget);
 
     mainLayout->addWidget(playlistGroup);
@@ -215,7 +295,11 @@ void MainWindow::setupRightPanel(QWidget *parent, QHBoxLayout *mainLayout)
     textLayout->addWidget(m_albumLabel);
 
     infoLayout->addWidget(infoText);
-    infoLayout->addStretch();
+
+    m_spectrumWidget = new SpectrumWidget(parent);
+    m_spectrumWidget->setObjectName("spectrumWidget");
+    infoLayout->addWidget(m_spectrumWidget, 1);
+
     layout->addWidget(infoHeader);
 
     // --- Lyrics offset controls ---
@@ -247,6 +331,14 @@ void MainWindow::setupRightPanel(QWidget *parent, QHBoxLayout *mainLayout)
     connect(m_lyricsOffsetPlusBtn, &QPushButton::clicked,
             this, &MainWindow::onLyricsOffsetPlus);
     offsetLayout->addWidget(m_lyricsOffsetPlusBtn);
+
+    QPushButton *addToPlaylistBtn = new QPushButton("+", parent);
+    addToPlaylistBtn->setFixedSize(28, 28);
+    addToPlaylistBtn->setObjectName("miniBtn");
+    addToPlaylistBtn->setToolTip("Add to playlist");
+    connect(addToPlaylistBtn, &QPushButton::clicked,
+            this, &MainWindow::onQuickAddToPlaylist);
+    offsetLayout->addWidget(addToPlaylistBtn);
 
     offsetLayout->addStretch();
     layout->addWidget(offsetBar);
@@ -348,6 +440,17 @@ void MainWindow::setupToolBar()
     QAction *transcodeAction = toolbar->addAction(
         QString::fromUtf8("\xF0\x9F\x94\x84") + " Convert");
     connect(transcodeAction, &QAction::triggered, this, &MainWindow::onTranscode);
+
+    m_karaokeAction = toolbar->addAction(
+        QString::fromUtf8("\xF0\x9F\x8E\xA4") + " Karaoke");
+    m_karaokeAction->setCheckable(true);
+    connect(m_karaokeAction, &QAction::triggered, this, &MainWindow::onToggleKaraoke);
+
+    m_themeAction = toolbar->addAction(
+        QString::fromUtf8("\xF0\x9F\x8C\x99") + " Dark");
+    m_themeAction->setCheckable(true);
+    m_themeAction->setChecked(m_darkTheme);
+    connect(m_themeAction, &QAction::triggered, this, &MainWindow::onToggleTheme);
 
     toolbar->addSeparator();
 
@@ -561,6 +664,29 @@ void MainWindow::onLyricsJumpRequested(qint64 timeMs)
     statusBar()->showMessage("Jumped to " + formatTime(timeMs), 2000);
 }
 
+void MainWindow::onToggleKaraoke()
+{
+    bool enabled = m_karaokeAction->isChecked();
+    m_lyricsWidget->setKaraokeMode(enabled);
+    statusBar()->showMessage(
+        enabled ? "Karaoke mode ON" : "Karaoke mode OFF", 2000);
+}
+
+void MainWindow::onToggleTheme()
+{
+    m_darkTheme = m_themeAction->isChecked();
+    m_themeAction->setText(m_darkTheme
+        ? QString::fromUtf8("\xE2\x98\x80\xEF\xB8\x8F") + " Light"
+        : QString::fromUtf8("\xF0\x9F\x8C\x99") + " Dark");
+    applyTheme();
+
+    // Persist choice
+    QSettings settings;
+    settings.setValue("theme/dark", m_darkTheme);
+    statusBar()->showMessage(
+        m_darkTheme ? "Dark theme" : "Light theme", 2000);
+}
+
 void MainWindow::onLyricsBrowsingChanged(bool isBrowsing)
 {
     Q_UNUSED(isBrowsing)
@@ -732,6 +858,9 @@ void MainWindow::loadTrack(int playlistIndex)
     // Load and play
     m_player->loadAndPlay(track.filePath);
 
+    // Load spectrum
+    m_spectrumWidget->loadAudioFile(track.filePath);
+
     // Load lyrics
     loadLyricsForCurrentTrack();
 
@@ -895,11 +1024,368 @@ void MainWindow::scanDirectory(const QString &dirPath, QList<Track> &outTracks)
     }
 }
 
+void MainWindow::onPlaylistComboContextMenu(const QPoint &pos)
+{
+    // Get the playlist name under the cursor
+    QModelIndex index = m_playlistCombo->view()->indexAt(pos);
+    if (!index.isValid())
+        return;
+
+    QString playlistName = index.data().toString();
+    if (playlistName.isEmpty() || playlistName == "All Tracks")
+        return;
+
+    QMenu menu(this);
+
+    QAction *playAction = menu.addAction(
+        QString::fromUtf8("\xE2\x96\xB6") + " Play");
+    QAction *pinAction = menu.addAction(
+        m_playlistManager->isPinned(playlistName)
+            ? QString::fromUtf8("\xF0\x9F\x93\x8C") + " Unpin"
+            : QString::fromUtf8("\xF0\x9F\x93\x8C") + " Pin to Top");
+    menu.addSeparator();
+    QAction *deleteAction = menu.addAction(
+        QString::fromUtf8("\xF0\x9F\x97\x91") + " Delete");
+
+    QAction *chosen = menu.exec(m_playlistCombo->view()->viewport()->mapToGlobal(pos));
+
+    if (chosen == playAction) {
+        // Switch to playlist and start playing first track
+        m_playlistCombo->setCurrentIndex(m_playlistCombo->findText(playlistName));
+        applyPlaylistFilter();
+        if (m_playlist->count() > 0) {
+            m_playlist->setCurrentIndex(0);
+            loadTrack(0);
+        }
+    } else if (chosen == pinAction) {
+        m_playlistManager->togglePin(playlistName);
+        statusBar()->showMessage(
+            m_playlistManager->isPinned(playlistName)
+                ? "Pinned: " + playlistName
+                : "Unpinned: " + playlistName, 2000);
+    } else if (chosen == deleteAction) {
+        if (QMessageBox::question(this, "Delete Playlist",
+                "Delete \"" + playlistName + "\"?",
+                QMessageBox::Yes | QMessageBox::No) == QMessageBox::Yes) {
+            if (m_playlistCombo->currentText() == playlistName) {
+                // Switch to All Tracks before deleting
+                m_playlistCombo->setCurrentIndex(0);
+            }
+            m_playlistManager->deletePlaylist(playlistName);
+            statusBar()->showMessage("Deleted: " + playlistName, 2000);
+        }
+    }
+}
+
 // ============================================================
-// Stylesheet - Dark theme
+// Playlist management slots
 // ============================================================
 
-void MainWindow::applyStylesheet()
+void MainWindow::applyPlaylistFilter()
+{
+    QString name = m_playlistCombo->currentText();
+    QList<Track> allTracks = m_library->loadLibrary();
+
+    if (name == "All Tracks" || name.isEmpty()) {
+        m_playlist->setTracks(allTracks);
+    } else {
+        QStringList paths = m_playlistManager->tracksInPlaylist(name);
+        QList<Track> filtered;
+        for (const auto &t : allTracks) {
+            if (paths.contains(t.filePath))
+                filtered.append(t);
+        }
+        m_playlist->setTracks(filtered);
+    }
+
+    refreshPlaylistWidget();
+}
+
+void MainWindow::onPlaylistComboChanged(int /*index*/)
+{
+    applyPlaylistFilter();
+}
+
+void MainWindow::onNewPlaylist()
+{
+    bool ok = false;
+    QString name = QInputDialog::getText(
+        this, "New Playlist", "Playlist name:",
+        QLineEdit::Normal, "", &ok);
+
+    if (!ok || name.trimmed().isEmpty())
+        return;
+
+    name = name.trimmed();
+
+    if (m_playlistManager->playlistExists(name)) {
+        QMessageBox::warning(this, "New Playlist",
+                             "Playlist \"" + name + "\" already exists.");
+        return;
+    }
+
+    // Show selection dialog with all tracks
+    QList<Track> allTracks = m_library->loadLibrary();
+    if (allTracks.isEmpty()) {
+        // Create empty playlist if no tracks in library
+        if (m_playlistManager->createPlaylist(name)) {
+            m_playlistCombo->setCurrentIndex(m_playlistCombo->findText(name));
+            statusBar()->showMessage("Created playlist: " + name, 3000);
+        }
+        return;
+    }
+
+    QDialog dlg(this);
+    dlg.setWindowTitle("Select songs for \"" + name + "\"");
+    dlg.resize(420, 400);
+
+    QVBoxLayout *dlgLayout = new QVBoxLayout(&dlg);
+
+    QLabel *hint = new QLabel("Check songs to add:");
+    hint->setStyleSheet("color: #909399; font-size: 12px;");
+    dlgLayout->addWidget(hint);
+
+    QListWidget *list = new QListWidget(&dlg);
+    list->setSelectionMode(QAbstractItemView::NoSelection);
+    for (const auto &t : allTracks) {
+        QString display = t.title;
+        if (!t.artist.isEmpty())
+            display += "  -  " + t.artist;
+        QListWidgetItem *item = new QListWidgetItem(display, list);
+        item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
+        item->setCheckState(Qt::Unchecked);
+        item->setData(Qt::UserRole, t.filePath);
+    }
+    dlgLayout->addWidget(list);
+
+    // Select all / Deselect all buttons
+    QHBoxLayout *btnRow = new QHBoxLayout();
+    QPushButton *selectAll = new QPushButton("Select All");
+    QPushButton *deselectAll = new QPushButton("Deselect All");
+    selectAll->setObjectName("miniBtn");
+    deselectAll->setObjectName("miniBtn");
+    btnRow->addWidget(selectAll);
+    btnRow->addWidget(deselectAll);
+    btnRow->addStretch();
+    dlgLayout->addLayout(btnRow);
+
+    connect(selectAll, &QPushButton::clicked, [list]() {
+        for (int i = 0; i < list->count(); i++)
+            list->item(i)->setCheckState(Qt::Checked);
+    });
+    connect(deselectAll, &QPushButton::clicked, [list]() {
+        for (int i = 0; i < list->count(); i++)
+            list->item(i)->setCheckState(Qt::Unchecked);
+    });
+
+    QDialogButtonBox *buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    dlgLayout->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted)
+        return;
+
+    // Create playlist and add checked tracks
+    if (!m_playlistManager->createPlaylist(name))
+        return;
+
+    int added = 0;
+    for (int i = 0; i < list->count(); i++) {
+        QListWidgetItem *item = list->item(i);
+        if (item->checkState() == Qt::Checked) {
+            QString path = item->data(Qt::UserRole).toString();
+            if (m_playlistManager->addTrack(name, path))
+                added++;
+        }
+    }
+
+    m_playlistCombo->setCurrentIndex(m_playlistCombo->findText(name));
+    statusBar()->showMessage(
+        QString("Created \"%1\" with %2 songs").arg(name).arg(added), 3000);
+}
+
+void MainWindow::onAutoGenerate()
+{
+    QMenu menu(this);
+
+    QAction *byArtist = menu.addAction("By Artist");
+    QAction *byAlbum = menu.addAction("By Album");
+    QAction *byTag = menu.addAction("By Tag");
+
+    QAction *chosen = menu.exec(m_autoGenBtn->mapToGlobal(QPoint(0, m_autoGenBtn->height())));
+
+    QList<Track> allTracks = m_library->loadLibrary();
+    if (allTracks.isEmpty()) {
+        QMessageBox::information(this, "Auto Generate",
+                                 "No tracks in library. Scan a folder first.");
+        return;
+    }
+
+    if (chosen == byArtist) {
+        m_playlistManager->generateByArtist(allTracks);
+        statusBar()->showMessage("Generated artist playlists", 3000);
+    } else if (chosen == byAlbum) {
+        m_playlistManager->generateByAlbum(allTracks);
+        statusBar()->showMessage("Generated album playlists", 3000);
+    } else if (chosen == byTag) {
+        m_playlistManager->generateByTag(allTracks);
+        statusBar()->showMessage("Generated tag playlists", 3000);
+    }
+}
+
+void MainWindow::onPlaylistContextMenu(const QPoint &pos)
+{
+    QListWidgetItem *item = m_playlistWidget->itemAt(pos);
+    if (!item)
+        return;
+
+    // Find the track in the filtered list
+    int row = m_playlistWidget->row(item);
+    QList<Track> filtered = m_playlist->filteredTracks();
+    if (row < 0 || row >= filtered.size())
+        return;
+
+    // Store for context menu actions
+    m_contextTrackPath = filtered[row].filePath;
+
+    QMenu menu(this);
+    QAction *editTagsAction = menu.addAction("Edit Tags...");
+    menu.addSeparator();
+
+    // "Add to Playlist" submenu
+    QMenu *addMenu = menu.addMenu("Add to Playlist");
+    QStringList userLists = m_playlistManager->userPlaylistNames();
+    if (userLists.isEmpty()) {
+        QAction *empty = addMenu->addAction("(no playlists — create one first)");
+        empty->setEnabled(false);
+    } else {
+        for (const auto &name : userLists) {
+            QAction *a = addMenu->addAction(name);
+            a->setData(name);
+        }
+    }
+
+    QAction *chosen = menu.exec(m_playlistWidget->mapToGlobal(pos));
+
+    if (chosen == editTagsAction) {
+        onEditTags();
+    } else if (chosen && chosen->data().isValid()) {
+        // Add to playlist
+        QString playlistName = chosen->data().toString();
+        if (m_playlistManager->addTrack(playlistName, m_contextTrackPath)) {
+            statusBar()->showMessage(
+                "Added to " + playlistName, 2000);
+        }
+    }
+}
+
+void MainWindow::onEditTags()
+{
+    if (m_contextTrackPath.isEmpty())
+        return;
+
+    // Find the track in the library
+    QList<Track> allTracks = m_library->loadLibrary();
+    Track *track = nullptr;
+    for (auto &t : allTracks) {
+        if (t.filePath == m_contextTrackPath) {
+            track = &t;
+            break;
+        }
+    }
+    if (!track)
+        return;
+
+    QString currentTags = track->tags.join(", ");
+    bool ok = false;
+    QString newTags = QInputDialog::getText(
+        this, "Edit Tags",
+        "Tags (comma-separated):",
+        QLineEdit::Normal, currentTags, &ok);
+
+    if (!ok)
+        return;
+
+    // Parse and update tags
+    QStringList tagList;
+    QStringList parts = newTags.split(',', Qt::SkipEmptyParts);
+    for (const auto &p : parts) {
+        QString trimmed = p.trimmed();
+        if (!trimmed.isEmpty())
+            tagList.append(trimmed);
+    }
+    track->tags = tagList;
+
+    // Persist
+    m_library->saveLibrary(allTracks);
+
+    // Also update the in-memory playlist
+    QList<Track> playing = m_playlist->allTracks();
+    for (auto &t : playing) {
+        if (t.filePath == m_contextTrackPath)
+            t.tags = tagList;
+    }
+    m_playlist->setTracks(playing);
+
+    statusBar()->showMessage("Tags updated: " + track->tags.join(", "), 3000);
+}
+
+void MainWindow::onAddToPlaylist()
+{
+    // Called from context menu (handled inline in onPlaylistContextMenu)
+}
+
+void MainWindow::onQuickAddToPlaylist()
+{
+    int idx = m_playlist->currentIndex();
+    if (idx < 0 || idx >= m_playlist->count()) {
+        statusBar()->showMessage("No track playing", 2000);
+        return;
+    }
+
+    QStringList userLists = m_playlistManager->userPlaylistNames();
+    if (userLists.isEmpty()) {
+        QMessageBox::information(this, "Add to Playlist",
+                                 "No playlists yet. Create one first with the + button.");
+        return;
+    }
+
+    QMenu menu(this);
+    for (const auto &name : userLists) {
+        QAction *a = menu.addAction(name);
+        a->setData(name);
+    }
+
+    // Show menu below the + button (approximate position)
+    QAction *chosen = menu.exec(QCursor::pos());
+
+    if (chosen && chosen->data().isValid()) {
+        QString playlistName = chosen->data().toString();
+        const Track &track = m_playlist->trackAt(idx);
+        if (m_playlistManager->addTrack(playlistName, track.filePath)) {
+            statusBar()->showMessage(
+                "Added \"" + track.title + "\" to " + playlistName, 2000);
+        } else {
+            statusBar()->showMessage("Already in " + playlistName, 2000);
+        }
+    }
+}
+
+// ============================================================
+// Theme management
+// ============================================================
+
+void MainWindow::applyTheme()
+{
+    setStyleSheet(m_darkTheme ? darkStylesheet() : lightStylesheet());
+    m_lyricsWidget->setDarkMode(m_darkTheme);
+    m_lyricsWidget->update();
+    m_spectrumWidget->update();
+}
+
+QString MainWindow::lightStylesheet() const
 {
     QString style = R"(
         /* ===== Main Window ===== */
@@ -910,6 +1396,10 @@ void MainWindow::applyStylesheet()
         QWidget#rightPanel {
             background-color: #ffffff;
             border-radius: 8px;
+        }
+
+        QWidget#lyricsArea {
+            background-color: #ffffff;
         }
 
         QWidget#controlBar {
@@ -1053,6 +1543,36 @@ void MainWindow::applyStylesheet()
             color: #409eff;
         }
 
+        QPushButton#miniBtn {
+            background-color: #f5f7fa;
+            color: #606266;
+            border: 1px solid #dcdfe6;
+            border-radius: 4px;
+            font-size: 12px;
+            padding: 2px 6px;
+        }
+        QPushButton#miniBtn:hover {
+            background-color: #ecf5ff;
+            color: #409eff;
+        }
+
+        /* ===== Combo Box ===== */
+        QComboBox#playlistCombo {
+            background-color: #f5f7fa;
+            color: #303133;
+            border: 1px solid #dcdfe6;
+            border-radius: 4px;
+            padding: 4px 8px;
+            font-size: 12px;
+        }
+        QComboBox#playlistCombo:hover {
+            border-color: #c6e2ff;
+        }
+        QComboBox#playlistCombo::drop-down {
+            border: none;
+            width: 20px;
+        }
+
         /* ===== Labels ===== */
         QLabel {
             color: #303133;
@@ -1134,10 +1654,21 @@ void MainWindow::applyStylesheet()
         QToolBar#mainToolBar QToolButton:hover {
             background-color: #f0f2f5;
         }
+        QToolBar#mainToolBar QToolButton:checked {
+            background-color: #ecf5ff;
+            color: #409eff;
+            border-radius: 4px;
+        }
         QToolBar#mainToolBar::separator {
             color: #e4e7ed;
             width: 2px;
             margin: 4px 4px;
+        }
+
+        /* ===== Spectrum Widget ===== */
+        QWidget#spectrumWidget {
+            background-color: #f5f7fa;
+            border-radius: 6px;
         }
 
         /* ===== Status Bar ===== */
@@ -1149,6 +1680,308 @@ void MainWindow::applyStylesheet()
             padding: 2px 8px;
         }
     )";
+    return style;
+}
 
-    setStyleSheet(style);
+QString MainWindow::darkStylesheet() const
+{
+    return QString::fromUtf8(R"(
+        /* ===== Main Window ===== */
+        QMainWindow {
+            background-color: #1a1a2e;
+        }
+
+        QWidget#rightPanel {
+            background-color: #252536;
+            border-radius: 8px;
+        }
+
+        QWidget#lyricsArea {
+            background-color: #252536;
+        }
+
+        QWidget#controlBar {
+            background-color: #252536;
+            border-top: 1px solid #3e3e5e;
+        }
+
+        /* ===== Group Box ===== */
+        QGroupBox {
+            color: #cdd6f4;
+            border: 1px solid #3e3e5e;
+            border-radius: 8px;
+            margin-top: 12px;
+            background-color: #252536;
+            font-weight: bold;
+            font-size: 13px;
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin;
+            left: 12px;
+            padding: 0 8px;
+            color: #a6adc8;
+        }
+
+        /* ===== Playlist ===== */
+        QListWidget {
+            background-color: #1e1e2e;
+            border: none;
+            border-radius: 4px;
+            color: #cdd6f4;
+            padding: 4px;
+            outline: none;
+            font-size: 13px;
+        }
+        QListWidget::item {
+            padding: 10px 12px;
+            border-radius: 6px;
+            margin: 1px 0;
+        }
+        QListWidget::item:hover {
+            background-color: #313244;
+        }
+        QListWidget::item:selected {
+            background-color: #313244;
+            color: #89b4fa;
+        }
+
+        /* ===== Track Info ===== */
+        QLabel#trackTitle {
+            color: #cdd6f4;
+        }
+        QLabel#trackArtist {
+            color: #a6adc8;
+        }
+        QLabel#trackAlbum {
+            color: #6c7086;
+        }
+        QLabel#coverPlaceholder {
+            background-color: #313244;
+            color: #6c7086;
+            border-radius: 8px;
+            font-size: 18px;
+            font-weight: bold;
+        }
+        QLabel#offsetTitle {
+            color: #6c7086;
+            font-size: 12px;
+        }
+        QLabel#offsetValue {
+            color: #89b4fa;
+            font-size: 12px;
+            font-weight: bold;
+        }
+
+        /* ===== Buttons ===== */
+        QPushButton {
+            background-color: #313244;
+            color: #cdd6f4;
+            border: 1px solid #45475a;
+            border-radius: 6px;
+            padding: 6px 12px;
+            font-size: 14px;
+        }
+        QPushButton:hover {
+            background-color: #45475a;
+            border-color: #585b70;
+            color: #89b4fa;
+        }
+        QPushButton:pressed {
+            background-color: #585b70;
+        }
+
+        QPushButton#offsetBtn {
+            background-color: #313244;
+            color: #a6adc8;
+            border: 1px solid #45475a;
+            border-radius: 4px;
+            font-size: 11px;
+            padding: 2px 6px;
+        }
+        QPushButton#offsetBtn:hover {
+            background-color: #45475a;
+            color: #89b4fa;
+        }
+
+        QPushButton#controlBtn {
+            background-color: transparent;
+            border: none;
+            font-size: 18px;
+            color: #a6adc8;
+        }
+        QPushButton#controlBtn:hover {
+            background-color: #313244;
+            border-radius: 8px;
+            color: #89b4fa;
+        }
+
+        QPushButton#playButton {
+            background-color: #89b4fa;
+            color: #1e1e2e;
+            border: none;
+            border-radius: 24px;
+            font-size: 20px;
+        }
+        QPushButton#playButton:hover {
+            background-color: #b4d0fb;
+        }
+        QPushButton#playButton:pressed {
+            background-color: #74a8f7;
+        }
+
+        QPushButton#modeBtn {
+            background-color: transparent;
+            border: none;
+            font-size: 18px;
+            color: #a6adc8;
+        }
+        QPushButton#modeBtn:hover {
+            background-color: #313244;
+            border-radius: 8px;
+            color: #89b4fa;
+        }
+
+        QPushButton#miniBtn {
+            background-color: #313244;
+            color: #a6adc8;
+            border: 1px solid #45475a;
+            border-radius: 4px;
+            font-size: 12px;
+            padding: 2px 6px;
+        }
+        QPushButton#miniBtn:hover {
+            background-color: #45475a;
+            color: #89b4fa;
+        }
+
+        /* ===== Combo Box ===== */
+        QComboBox#playlistCombo {
+            background-color: #313244;
+            color: #cdd6f4;
+            border: 1px solid #45475a;
+            border-radius: 4px;
+            padding: 4px 8px;
+            font-size: 12px;
+        }
+        QComboBox#playlistCombo:hover {
+            border-color: #585b70;
+        }
+        QComboBox#playlistCombo::drop-down {
+            border: none;
+            width: 20px;
+        }
+        QComboBox QAbstractItemView {
+            background-color: #313244;
+            color: #cdd6f4;
+            selection-background-color: #45475a;
+            selection-color: #89b4fa;
+        }
+
+        /* ===== Labels ===== */
+        QLabel {
+            color: #cdd6f4;
+        }
+
+        QLabel#modeLabel {
+            color: #6c7086;
+            font-size: 12px;
+            padding: 0 8px;
+        }
+
+        QLabel#timeLabel {
+            color: #a6adc8;
+            font-size: 12px;
+        }
+
+        /* ===== Sliders ===== */
+        QSlider#progressSlider::groove:horizontal {
+            height: 4px;
+            background-color: #45475a;
+            border-radius: 2px;
+        }
+        QSlider#progressSlider::handle:horizontal {
+            background-color: #89b4fa;
+            width: 14px;
+            height: 14px;
+            margin: -5px 0;
+            border-radius: 7px;
+        }
+        QSlider#progressSlider::sub-page:horizontal {
+            background-color: #89b4fa;
+            border-radius: 2px;
+        }
+
+        QSlider#volumeSlider::groove:horizontal {
+            height: 3px;
+            background-color: #45475a;
+            border-radius: 2px;
+        }
+        QSlider#volumeSlider::handle:horizontal {
+            background-color: #a6adc8;
+            width: 12px;
+            height: 12px;
+            margin: -4px 0;
+            border-radius: 6px;
+        }
+        QSlider#volumeSlider::sub-page:horizontal {
+            background-color: #a6adc8;
+            border-radius: 2px;
+        }
+
+        /* ===== Search Box ===== */
+        QLineEdit#searchBox {
+            background-color: #313244;
+            color: #cdd6f4;
+            border: 1px solid #45475a;
+            border-radius: 16px;
+            padding: 6px 14px;
+            font-size: 13px;
+        }
+        QLineEdit#searchBox:focus {
+            border-color: #89b4fa;
+            background-color: #1e1e2e;
+        }
+
+        /* ===== Toolbar ===== */
+        QToolBar#mainToolBar {
+            background-color: #252536;
+            border: none;
+            border-bottom: 1px solid #3e3e5e;
+            spacing: 8px;
+            padding: 4px 12px;
+        }
+        QToolBar#mainToolBar QToolButton {
+            color: #a6adc8;
+            padding: 4px 10px;
+            border-radius: 4px;
+        }
+        QToolBar#mainToolBar QToolButton:hover {
+            background-color: #313244;
+        }
+        QToolBar#mainToolBar QToolButton:checked {
+            background-color: #313244;
+            color: #89b4fa;
+            border-radius: 4px;
+        }
+        QToolBar#mainToolBar::separator {
+            color: #3e3e5e;
+            width: 2px;
+            margin: 4px 4px;
+        }
+
+        /* ===== Spectrum Widget ===== */
+        QWidget#spectrumWidget {
+            background-color: #1e1e2e;
+            border-radius: 6px;
+        }
+
+        /* ===== Status Bar ===== */
+        QStatusBar {
+            background-color: #1e1e2e;
+            color: #6c7086;
+            border-top: 1px solid #3e3e5e;
+            font-size: 12px;
+            padding: 2px 8px;
+        }
+    )");
 }

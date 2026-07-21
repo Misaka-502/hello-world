@@ -39,6 +39,9 @@ set(SOURCES
     src/lrcparser.cpp
     src/lyricswidget.cpp
     src/transcoder.cpp
+    src/lyricsrenderer.cpp
+    src/spectrumwidget.cpp
+    src/playlistmanager.cpp
     src/playmodestrategy.cpp
 )
 
@@ -51,6 +54,9 @@ set(HEADERS
     src/lrcparser.h
     src/lyricswidget.h
     src/transcoder.h
+    src/lyricsrenderer.h
+    src/spectrumwidget.h
+    src/playlistmanager.h
     src/playmodestrategy.h
 )
 

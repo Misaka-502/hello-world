@@ -1,17 +1,23 @@
 #include "lyricswidget.h"
+#include "lyricsrenderer.h"
 #include <QPainter>
 #include <QMouseEvent>
 #include <QWheelEvent>
 #include <QEvent>
+#include <algorithm>
 
 LyricsWidget::LyricsWidget(QWidget *parent)
     : QWidget(parent)
     , m_hoverTimer(new QTimer(this))
     , m_autoReturn(new QTimer(this))
+    , m_simpleRenderer(new SimpleLyricsRenderer)
+    , m_karaokeRenderer(new KaraokeLyricsRenderer)
 {
+    m_renderer = m_simpleRenderer;  // default
     setMouseTracking(true);
     setMinimumHeight(LINE_H * 5);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+    setAttribute(Qt::WA_StyledBackground, true);  // let QSS set background
 
     m_hoverTimer->setSingleShot(true);
     m_hoverTimer->setInterval(500);
@@ -22,10 +28,35 @@ LyricsWidget::LyricsWidget(QWidget *parent)
     connect(m_autoReturn, &QTimer::timeout, this, &LyricsWidget::onAutoReturn);
 }
 
+LyricsWidget::~LyricsWidget()
+{
+    delete m_simpleRenderer;
+    delete m_karaokeRenderer;
+}
+
+void LyricsWidget::setKaraokeMode(bool enabled)
+{
+    m_renderer = enabled ? m_karaokeRenderer : m_simpleRenderer;
+    update();
+}
+
+bool LyricsWidget::isKaraokeMode() const
+{
+    return m_renderer == m_karaokeRenderer;
+}
+
+void LyricsWidget::setDarkMode(bool dark)
+{
+    m_simpleRenderer->setDarkMode(dark);
+    m_karaokeRenderer->setDarkMode(dark);
+    update();
+}
+
 void LyricsWidget::setLyrics(const LrcParser &parser)
 {
     m_lines = parser.lines();
     m_curIdx = -1;
+    m_currentPlaybackPos = 0;
     m_viewTopIdx = 0;
     m_scrollPx = 0;
     m_browsing = false;
@@ -41,6 +72,7 @@ void LyricsWidget::clearLyrics()
 {
     m_lines.clear();
     m_curIdx = -1;
+    m_currentPlaybackPos = 0;
     m_viewTopIdx = 0;
     m_scrollPx = 0;
     m_browsing = false;
@@ -58,6 +90,7 @@ void LyricsWidget::updatePlaybackPosition(qint64 positionMs, int offsetMs)
         return;
 
     qint64 t = positionMs + offsetMs;
+    m_currentPlaybackPos = t;
 
     // Binary-search style: find last line with timeMs <= t
     int idx = -1;
@@ -85,7 +118,7 @@ void LyricsWidget::updatePlaybackPosition(qint64 positionMs, int offsetMs)
 }
 
 // ============================================================
-// paintEvent — draw all visible lines top-to-bottom
+// paintEvent — draw all visible lines via the active renderer
 // ============================================================
 
 void LyricsWidget::paintEvent(QPaintEvent *)
@@ -93,11 +126,12 @@ void LyricsWidget::paintEvent(QPaintEvent *)
     QPainter p(this);
     p.setRenderHint(QPainter::Antialiasing);
 
-    // Background
-    p.fillRect(rect(), QColor(255, 255, 255));
+    // Background handled by QSS
 
     if (m_lines.isEmpty()) {
-        p.setPen(QColor(144, 147, 153));
+        QColor placeholderColor = palette().color(QPalette::Text);
+        placeholderColor.setAlpha(128);
+        p.setPen(placeholderColor);
         p.setFont(QFont("sans-serif", 14));
         p.drawText(rect(), Qt::AlignCenter, "No lyrics loaded");
         return;
@@ -105,60 +139,54 @@ void LyricsWidget::paintEvent(QPaintEvent *)
 
     int w = width();
     int h = height();
+    const int lineH = m_renderer->lineHeight();
 
-    // The first visible line index (accounting for fine scroll offset)
     int topIdx = m_viewTopIdx;
     int offsetPx = m_scrollPx;
 
-    // How many lines fit on screen + 1 extra for partial
-    int visibleLines = h / LINE_H + 2;
+    int visibleLines = h / lineH + 2;
 
     for (int i = 0; i < visibleLines; i++) {
         int lineIdx = topIdx + i;
         if (lineIdx < 0 || lineIdx >= m_lines.size())
             continue;
 
-        int y = i * LINE_H - offsetPx;
-        if (y < -LINE_H || y > h + LINE_H)
+        int y = i * lineH - offsetPx;
+        if (y < -lineH || y > h + lineH)
             continue;
 
         bool isActive = (lineIdx == m_curIdx) && !m_browsing;
 
-        // ---- Style ----
-        QColor col;
-        int fs;
-        if (isActive) {
-            col = QColor(64, 158, 255);  // bright blue
-            fs = 17;
-        } else {
-            // Fade gently with distance — clear enough to read,
-            // but never as prominent as the active line
-            int dist = qAbs(lineIdx - m_curIdx);
-            int alpha = 210 - dist * 20;
-            if (alpha < 100) alpha = 100;
-            col = QColor(80, 82, 86, alpha);
-            fs = 13;
+        // Compute character progress for karaoke effect
+        float charProgress = 0.0f;
+        if (isActive && m_curIdx >= 0) {
+            qint64 curTime = m_lines[m_curIdx].timeMs;
+            if (m_curIdx + 1 < m_lines.size()) {
+                qint64 nextTime = m_lines[m_curIdx + 1].timeMs;
+                if (nextTime > curTime) {
+                    qint64 elapsed = m_currentPlaybackPos - curTime;
+                    charProgress = static_cast<float>(elapsed)
+                                   / static_cast<float>(nextTime - curTime);
+                    charProgress = std::clamp(charProgress, 0.0f, 1.0f);
+                }
+            }
         }
 
-        QFont font("sans-serif", fs);
-        if (isActive) font.setBold(true);
-        p.setFont(font);
-        p.setPen(col);
-
-        // Draw text centered horizontally, vertically centered in its line slot
+        // Elide text if needed
         QString text = m_lines[lineIdx].text;
-        // Elide if needed
-        QFontMetrics fm(font);
+        QFontMetrics fm(QFont("sans-serif", isActive ? 20 : 13));
         int maxW = w - 60;
         if (fm.horizontalAdvance(text) > maxW)
             text = fm.elidedText(text, Qt::ElideRight, maxW);
 
-        QRect r(30, y, w - 60, LINE_H);
-        p.drawText(r, Qt::AlignVCenter | Qt::AlignHCenter, text);
+        QRect lineRect(30, y, w - 60, lineH);
 
-        // Draw highlight border around hovered line
+        // Delegate drawing to the active renderer strategy
+        m_renderer->paintLine(p, lineRect, text, isActive, charProgress);
+
+        // Draw highlight border around hovered line (unchanged)
         if (lineIdx == m_highlightedIdx) {
-            QRect hr(20, y + 2, w - 40, LINE_H - 4);
+            QRect hr(20, y + 2, w - 40, lineH - 4);
             p.setPen(QPen(QColor(64, 158, 255), 2));
             p.setBrush(Qt::NoBrush);
             p.drawRoundedRect(hr, 8, 8);
@@ -188,14 +216,13 @@ void LyricsWidget::mousePressEvent(QMouseEvent *event)
         return;
     }
 
-    // Otherwise start drag
+    // Otherwise prepare for potential drag (don't enter browsing yet)
     m_dragging = true;
-    m_browsing = true;
     m_dragY = event->pos().y();
+    m_dragStartY = event->pos().y();
     m_highlightedIdx = -1;
     m_hoverTimer->stop();
     m_autoReturn->stop();
-    emit browsingStateChanged(true);
     setCursor(Qt::ClosedHandCursor);
 }
 
@@ -203,8 +230,15 @@ void LyricsWidget::mouseMoveEvent(QMouseEvent *event)
 {
     if (m_dragging) {
         int dy = event->pos().y() - m_dragY;
+        int totalDy = event->pos().y() - m_dragStartY;
         m_scrollPx -= dy;
         m_dragY = event->pos().y();
+
+        // Only enter browsing mode on actual drag (> 5px to avoid click jitter)
+        if (!m_browsing && qAbs(totalDy) > 5) {
+            m_browsing = true;
+            emit browsingStateChanged(true);
+        }
 
         // Normalize: convert pixel scroll to line changes
         while (m_scrollPx >= LINE_H) {
@@ -229,6 +263,9 @@ void LyricsWidget::mouseMoveEvent(QMouseEvent *event)
             m_highlightedIdx = -1;  // clear old highlight
             if (idx >= 0) {
                 m_hoverTimer->start();  // restart 0.5s timer
+                // During browsing, hovering a new line resets the 3s countdown
+                if (m_browsing)
+                    m_autoReturn->start();
             } else {
                 m_hoverTimer->stop();
             }
@@ -242,8 +279,14 @@ void LyricsWidget::mouseReleaseEvent(QMouseEvent *event)
 {
     if (event->button() == Qt::LeftButton && m_dragging) {
         m_dragging = false;
-        m_autoReturn->start();
-        setCursor(Qt::OpenHandCursor);
+        if (m_browsing) {
+            // Actual drag happened — start 3s auto-return countdown
+            m_autoReturn->start();
+            setCursor(Qt::OpenHandCursor);
+        } else {
+            // Simple click without drag — stay in follow mode
+            setCursor(Qt::ArrowCursor);
+        }
     }
 }
 

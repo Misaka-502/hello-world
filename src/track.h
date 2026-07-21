@@ -12,6 +12,7 @@ struct Track {
     QString album;
     qint64 duration = 0;       // milliseconds
     int lyricsOffset = 0;      // milliseconds, persisted per-song for lyrics sync correction
+    QStringList tags;          // user-defined tags for categorization
 
     // Serialize to/from JSON for persistence
     QJsonObject toJson() const;

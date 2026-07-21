@@ -5,9 +5,11 @@
 #include <QMediaPlayer>
 #include "track.h"
 
+class QComboBox;
 class QHBoxLayout;
 class QListWidget;
 class QLabel;
+class QMenu;
 class QPushButton;
 class QSlider;
 class QLineEdit;
@@ -16,9 +18,11 @@ class QTimer;
 
 class Player;
 class Playlist;
+class PlaylistManager;
 class Library;
 class LrcParser;
 class LyricsWidget;
+class SpectrumWidget;
 class Transcoder;
 
 class MainWindow : public QMainWindow
@@ -74,6 +78,22 @@ private slots:
     void onTranscodeProgress(int percent);
     void onTranscodeFinished(bool success, const QString &outputFile);
 
+    // Karaoke toggle
+    void onToggleKaraoke();
+
+    // Theme toggle
+    void onToggleTheme();
+
+    // Playlist management
+    void onPlaylistComboChanged(int index);
+    void onNewPlaylist();
+    void onAutoGenerate();
+    void onPlaylistContextMenu(const QPoint &pos);
+    void onEditTags();
+    void onAddToPlaylist();
+    void onQuickAddToPlaylist();
+    void onPlaylistComboContextMenu(const QPoint &pos);
+
 private:
     // UI setup
     void setupUI();
@@ -81,7 +101,9 @@ private:
     void setupRightPanel(QWidget *parent, QHBoxLayout *mainLayout);
     QWidget *setupControlBar();
     void setupToolBar();
-    void applyStylesheet();
+    void applyTheme();                     // apply current theme
+    QString lightStylesheet() const;       // light theme QSS
+    QString darkStylesheet() const;        // dark theme QSS
 
     // Helpers
     void loadTrack(int playlistIndex);
@@ -91,15 +113,20 @@ private:
     void updateTrackInfoDisplay();
     QString formatTime(qint64 ms) const;
     void scanDirectory(const QString &dirPath, QList<Track> &outTracks);
+    void applyPlaylistFilter();  // load selected playlist into playing queue
 
     // --- Core components ---
     Player *m_player;
     Playlist *m_playlist;
+    PlaylistManager *m_playlistManager;
     Library *m_library;
     LrcParser *m_lrcParser;
     Transcoder *m_transcoder;
 
     // --- UI: Left panel ---
+    QComboBox *m_playlistCombo;
+    QPushButton *m_newPlaylistBtn;
+    QPushButton *m_autoGenBtn;
     QListWidget *m_playlistWidget;
     QLabel *m_playlistTitleLabel;
 
@@ -110,6 +137,7 @@ private:
     QLabel *m_artistLabel;
     QLabel *m_albumLabel;
     LyricsWidget *m_lyricsWidget;
+    SpectrumWidget *m_spectrumWidget;
     QPushButton *m_lyricsOffsetPlusBtn;
     QPushButton *m_lyricsOffsetMinusBtn;
     QLabel *m_lyricsOffsetLabel;
@@ -127,10 +155,14 @@ private:
 
     // --- UI: Toolbar ---
     QLineEdit *m_searchEdit;
+    QAction *m_karaokeAction = nullptr;
+    QAction *m_themeAction = nullptr;
 
     // --- State ---
     bool m_sliderDragging = false;
+    bool m_darkTheme = false;
     qint64 m_currentDuration = 0;
+    QString m_contextTrackPath;  // for right-click context menu
 };
 
 #endif // MAINWINDOW_H

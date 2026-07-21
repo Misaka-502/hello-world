@@ -1,4 +1,5 @@
 #include "transcoder.h"
+#include <QCoreApplication>
 #include <QDir>
 #include <QFileInfo>
 #include <QRegularExpression>
@@ -71,31 +72,75 @@ void Transcoder::cancel()
 
 bool Transcoder::isFfmpegAvailable()
 {
-    QProcess test;
-    test.start(ffmpegPath(), {"-version"});
-    return test.waitForFinished(3000) && test.exitCode() == 0;
+    return !ffmpegPath().isEmpty();
 }
 
 QString Transcoder::ffmpegPath()
 {
-    // Check common locations
-    QStringList candidates = {
-        "ffmpeg",
-        "ffmpeg.exe",
-#ifdef Q_OS_WIN
-        QDir::currentPath() + "/ffmpeg.exe",
-        QDir::currentPath() + "/ffmpeg/bin/ffmpeg.exe",
-        "C:/ffmpeg/bin/ffmpeg.exe",
-#endif
-    };
+    // Cache the result — searching + verifying is expensive
+    static QString s_cachedPath;
+    static bool s_checked = false;
+
+    if (s_checked)
+        return s_cachedPath;
+
+    s_checked = true;
+
+    // Build candidate list in priority order
+    QStringList candidates;
+
+    // 1. Check PATH (bare executable name)
+    candidates << "ffmpeg" << "ffmpeg.exe";
+
+    // 2. Check relative to application directory
+    const QString appDir = QCoreApplication::applicationDirPath();
+    candidates << appDir + "/ffmpeg.exe";
+    candidates << appDir + "/ffmpeg/bin/ffmpeg.exe";
+
+    // 3. Check relative to current working directory
+    const QString cwd = QDir::currentPath();
+    candidates << cwd + "/ffmpeg.exe";
+    candidates << cwd + "/ffmpeg/bin/ffmpeg.exe";
+
+    // 4. Gyan FFmpeg winget install (bundled with the project)
+    // Search relative to cwd, app dir, and their parents (for build/ subdir case)
+    const QString gyanRelPath =
+        "Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe/"
+        "ffmpeg-8.1.2-full_build/bin/ffmpeg.exe";
+    candidates << cwd + "/" + gyanRelPath;
+    candidates << appDir + "/" + gyanRelPath;
+    {
+        QDir parent(cwd);
+        parent.cdUp();
+        candidates << parent.absoluteFilePath(gyanRelPath);
+    }
+    {
+        QDir parent(appDir);
+        parent.cdUp();
+        candidates << parent.absoluteFilePath(gyanRelPath);
+    }
+
+    // 5. Common absolute install paths on Windows
+    candidates << "C:/ffmpeg/bin/ffmpeg.exe";
 
     for (const auto &path : candidates) {
+        // Quick file-existence check first (avoid spawning QProcess for nothing)
+        if (!path.contains('/') && !path.contains('\\')) {
+            // Bare name like "ffmpeg" — skip file check, go straight to QProcess
+        } else if (!QFileInfo::exists(path)) {
+            continue;
+        }
+
         QProcess test;
         test.start(path, {"-version"});
-        if (test.waitForFinished(3000) && test.exitCode() == 0)
-            return path;
+        if (test.waitForFinished(3000) && test.exitCode() == 0) {
+            s_cachedPath = path;
+            return s_cachedPath;
+        }
     }
-    return "ffmpeg";  // fallback
+
+    s_cachedPath = QString();  // empty signals "not found"
+    return s_cachedPath;
 }
 
 void Transcoder::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
@@ -106,17 +151,36 @@ void Transcoder::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus
 
 void Transcoder::onReadyReadStderr()
 {
+    // ffmpeg writes progress to stderr, using \r to overwrite the same line.
+    // Split on both \n and \r so we process each progress update individually.
     QString output = QString::fromUtf8(m_process->readAllStandardError());
-    QStringList lines = output.split('\n', Qt::SkipEmptyParts);
+    QStringList lines = output.split(QRegularExpression("[\r\n]"), Qt::SkipEmptyParts);
     for (const auto &line : lines) {
-        parseProgress(line);
+        parseProgress(line.trimmed());
     }
 }
 
 void Transcoder::parseProgress(const QString &line)
 {
-    // Parse "time=HH:MM:SS.xx" from ffmpeg stderr
-    static QRegularExpression timeRx(R"(time=(\d+):(\d+):(\d+)\.(\d+))");
+    // --- 1. Try to extract total duration ---
+    // Duration line looks like: "  Duration: 00:03:45.12, start: 0.000000, ..."
+    // This appears early in ffmpeg output, BEFORE the progress lines.
+    if (m_inputDurationSecs == 0) {
+        static QRegularExpression durRx(
+            R"(Duration:\s*(\d+):(\d+):(\d+)\.(\d+))");
+        auto durMatch = durRx.match(line);
+        if (durMatch.hasMatch()) {
+            int dh = durMatch.captured(1).toInt();
+            int dm = durMatch.captured(2).toInt();
+            int ds = durMatch.captured(3).toInt();
+            m_inputDurationSecs = dh * 3600 + dm * 60 + ds;
+        }
+    }
+
+    // --- 2. Try to extract current progress time ---
+    // Progress line looks like: "size=  1234kB time=00:01:23.45 bitrate=..."
+    static QRegularExpression timeRx(
+        R"(time=(\d+):(\d+):(\d+)\.(\d+))");
     auto match = timeRx.match(line);
     if (match.hasMatch()) {
         int h = match.captured(1).toInt();
@@ -124,18 +188,9 @@ void Transcoder::parseProgress(const QString &line)
         int s = match.captured(3).toInt();
         qint64 currentSecs = h * 3600 + m * 60 + s;
 
-        // Also parse duration if present
-        static QRegularExpression durRx(R"(Duration:\s*(\d+):(\d+):(\d+)\.(\d+))");
-        auto durMatch = durRx.match(line);
-        if (durMatch.hasMatch() && m_inputDurationSecs == 0) {
-            int dh = durMatch.captured(1).toInt();
-            int dm = durMatch.captured(2).toInt();
-            int ds = durMatch.captured(3).toInt();
-            m_inputDurationSecs = dh * 3600 + dm * 60 + ds;
-        }
-
         if (m_inputDurationSecs > 0) {
-            int percent = static_cast<int>(currentSecs * 100 / m_inputDurationSecs);
+            int percent = static_cast<int>(
+                currentSecs * 100 / m_inputDurationSecs);
             percent = qBound(0, percent, 100);
             emit progressChanged(percent);
         }
