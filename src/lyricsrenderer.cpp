@@ -17,11 +17,12 @@ void SimpleLyricsRenderer::paintLine(QPainter &p, const QRect &rect,
 
     if (isActive) {
         col = m_dark ? QColor(137, 180, 250) : QColor(64, 158, 255);
-        font.setPixelSize(17);
+        font.setPixelSize(18);
         font.setBold(true);
     } else {
         col = m_dark ? QColor(166, 173, 200, 160) : QColor(80, 82, 86, 180);
-        font.setPixelSize(13);
+        font.setPixelSize(14);
+        font.setBold(true);
     }
 
     p.setFont(font);
@@ -53,7 +54,8 @@ void KaraokeLyricsRenderer::paintLine(QPainter &p, const QRect &rect,
         // Inactive line — same as Simple inactive
         QColor col = m_dark ? QColor(166, 173, 200, 160) : QColor(80, 82, 86, 180);
         QFont font("sans-serif");
-        font.setPixelSize(13);
+        font.setPixelSize(14);
+        font.setBold(true);
         p.setFont(font);
         p.setPen(col);
 
@@ -79,7 +81,7 @@ void KaraokeLyricsRenderer::paintLine(QPainter &p, const QRect &rect,
     QString unplayedPart = text.mid(splitIdx);
 
     QFont activeFont("sans-serif");
-    activeFont.setPixelSize(20);
+    activeFont.setPixelSize(21);
     activeFont.setBold(true);
 
     QFontMetrics fm(activeFont);

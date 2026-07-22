@@ -174,7 +174,7 @@ void LyricsWidget::paintEvent(QPaintEvent *)
 
         // Elide text if needed
         QString text = m_lines[lineIdx].text;
-        QFontMetrics fm(QFont("sans-serif", isActive ? 20 : 13));
+        QFontMetrics fm(QFont("sans-serif", isActive ? 21 : 14));
         int maxW = w - 60;
         if (fm.horizontalAdvance(text) > maxW)
             text = fm.elidedText(text, Qt::ElideRight, maxW);

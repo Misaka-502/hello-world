@@ -163,6 +163,7 @@ private:
     bool m_darkTheme = false;
     qint64 m_currentDuration = 0;
     QString m_contextTrackPath;  // for right-click context menu
+    QList<Track> m_allTracks;    // full library — always the master copy, saved to disk
 };
 
 #endif // MAINWINDOW_H

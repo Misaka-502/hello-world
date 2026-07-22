@@ -59,10 +59,10 @@ MainWindow::MainWindow(QWidget *parent)
     m_darkTheme = settings.value("theme/dark", false).toBool();
     applyTheme();
 
-    // Load persisted library
-    QList<Track> savedTracks = m_library->loadLibrary();
-    if (!savedTracks.isEmpty()) {
-        m_playlist->setTracks(savedTracks);
+    // Load persisted library — keep full master copy in m_allTracks
+    m_allTracks = m_library->loadLibrary();
+    if (!m_allTracks.isEmpty()) {
+        m_playlist->setTracks(m_allTracks);
         refreshPlaylistWidget();
         // Populate playlist combo
         m_playlistCombo->addItem("All Tracks");
@@ -71,7 +71,7 @@ MainWindow::MainWindow(QWidget *parent)
             m_playlistCombo->addItem(name);
         m_playlistCombo->setCurrentIndex(0);
         statusBar()->showMessage(
-            QString("Loaded %1 tracks from library").arg(savedTracks.size()), 3000);
+            QString("Loaded %1 tracks from library").arg(m_allTracks.size()), 3000);
     }
 
     // --- Connect signals ---
@@ -154,8 +154,8 @@ MainWindow::MainWindow(QWidget *parent)
 
 MainWindow::~MainWindow()
 {
-    // Save library on exit
-    m_library->saveLibrary(m_playlist->allTracks());
+    // Save the full library (not just the currently visible playlist view)
+    m_library->saveLibrary(m_allTracks);
     delete m_lrcParser;
 }
 
@@ -697,9 +697,16 @@ void MainWindow::onLyricsOffsetPlus()
 {
     int idx = m_playlist->currentIndex();
     if (idx < 0) return;
-    // Add 500ms
+    // Add 500ms — update both the active view and the master list
+    QString curPath = m_playlist->trackAt(idx).filePath;
     m_playlist->trackAt(idx).lyricsOffset += 500;
-    m_library->saveLibrary(m_playlist->allTracks());
+    for (auto &t : m_allTracks) {
+        if (t.filePath == curPath) {
+            t.lyricsOffset = m_playlist->trackAt(idx).lyricsOffset;
+            break;
+        }
+    }
+    m_library->saveLibrary(m_allTracks);
     int offsetMs = m_playlist->trackAt(idx).lyricsOffset;
     m_lyricsOffsetLabel->setText(
         QString("Offset: %1s").arg(offsetMs / 1000.0, 0, 'f', 1));
@@ -709,8 +716,15 @@ void MainWindow::onLyricsOffsetMinus()
 {
     int idx = m_playlist->currentIndex();
     if (idx < 0) return;
+    QString curPath = m_playlist->trackAt(idx).filePath;
     m_playlist->trackAt(idx).lyricsOffset -= 500;
-    m_library->saveLibrary(m_playlist->allTracks());
+    for (auto &t : m_allTracks) {
+        if (t.filePath == curPath) {
+            t.lyricsOffset = m_playlist->trackAt(idx).lyricsOffset;
+            break;
+        }
+    }
+    m_library->saveLibrary(m_allTracks);
     int offsetMs = m_playlist->trackAt(idx).lyricsOffset;
     m_lyricsOffsetLabel->setText(
         QString("Offset: %1s").arg(offsetMs / 1000.0, 0, 'f', 1));
@@ -727,7 +741,8 @@ void MainWindow::onScanFolder()
         return;
 
     m_playlist->clear();
-    m_library->saveLibrary(QList<Track>());
+    m_allTracks.clear();
+    m_library->saveLibrary(m_allTracks);
 
     QList<Track> tracks;
     scanDirectory(dir, tracks);
@@ -737,8 +752,9 @@ void MainWindow::onScanFolder()
         return;
     }
 
-    m_playlist->setTracks(tracks);
-    m_library->saveLibrary(tracks);
+    m_allTracks = tracks;
+    m_playlist->setTracks(m_allTracks);
+    m_library->saveLibrary(m_allTracks);
     refreshPlaylistWidget();
     statusBar()->showMessage(
         QString("Scanned %1 tracks from folder").arg(tracks.size()), 3000);
@@ -758,21 +774,22 @@ void MainWindow::onAddFolder()
         return;
     }
 
-    // Check for duplicates by file path
+    // Check for duplicates by file path — use m_allTracks as master
     QSet<QString> existingPaths;
-    for (const auto &t : m_playlist->allTracks())
+    for (const auto &t : m_allTracks)
         existingPaths.insert(t.filePath);
 
     int added = 0;
     for (const auto &t : newTracks) {
         if (!existingPaths.contains(t.filePath)) {
             m_playlist->addTrack(t);
+            m_allTracks.append(t);
             existingPaths.insert(t.filePath);
             added++;
         }
     }
 
-    m_library->saveLibrary(m_playlist->allTracks());
+    m_library->saveLibrary(m_allTracks);
     refreshPlaylistWidget();
     statusBar()->showMessage(
         QString("Added %1 new tracks").arg(added), 3000);
@@ -898,6 +915,14 @@ void MainWindow::loadLyricsForCurrentTrack()
             // Use [offset:] tag as initial offset if not already set
             if (track.lyricsOffset == 0 && m_lrcParser->fileOffset() != 0) {
                 m_playlist->trackAt(idx).lyricsOffset = m_lrcParser->fileOffset();
+                // Also sync to master list
+                for (auto &t : m_allTracks) {
+                    if (t.filePath == track.filePath) {
+                        t.lyricsOffset = m_lrcParser->fileOffset();
+                        break;
+                    }
+                }
+                m_library->saveLibrary(m_allTracks);
                 m_lyricsOffsetLabel->setText(
                     QString("Offset: %1s").arg(m_lrcParser->fileOffset() / 1000.0, 0, 'f', 1));
             }
@@ -992,8 +1017,14 @@ void MainWindow::updateTrackInfoDisplay()
     updateTimeLabel();
     refreshPlaylistWidget();
 
-    // Persist updated metadata
-    m_library->updateTrack(track);
+    // Persist updated metadata — sync to master list and save
+    for (auto &t : m_allTracks) {
+        if (t.filePath == track.filePath) {
+            t = track;
+            break;
+        }
+    }
+    m_library->saveLibrary(m_allTracks);
 }
 
 QString MainWindow::formatTime(qint64 ms) const
@@ -1084,14 +1115,13 @@ void MainWindow::onPlaylistComboContextMenu(const QPoint &pos)
 void MainWindow::applyPlaylistFilter()
 {
     QString name = m_playlistCombo->currentText();
-    QList<Track> allTracks = m_library->loadLibrary();
 
     if (name == "All Tracks" || name.isEmpty()) {
-        m_playlist->setTracks(allTracks);
+        m_playlist->setTracks(m_allTracks);
     } else {
         QStringList paths = m_playlistManager->tracksInPlaylist(name);
         QList<Track> filtered;
-        for (const auto &t : allTracks) {
+        for (const auto &t : m_allTracks) {
             if (paths.contains(t.filePath))
                 filtered.append(t);
         }
@@ -1124,9 +1154,8 @@ void MainWindow::onNewPlaylist()
         return;
     }
 
-    // Show selection dialog with all tracks
-    QList<Track> allTracks = m_library->loadLibrary();
-    if (allTracks.isEmpty()) {
+    // Show selection dialog with all tracks from master list
+    if (m_allTracks.isEmpty()) {
         // Create empty playlist if no tracks in library
         if (m_playlistManager->createPlaylist(name)) {
             m_playlistCombo->setCurrentIndex(m_playlistCombo->findText(name));
@@ -1147,7 +1176,7 @@ void MainWindow::onNewPlaylist()
 
     QListWidget *list = new QListWidget(&dlg);
     list->setSelectionMode(QAbstractItemView::NoSelection);
-    for (const auto &t : allTracks) {
+    for (const auto &t : m_allTracks) {
         QString display = t.title;
         if (!t.artist.isEmpty())
             display += "  -  " + t.artist;
@@ -1216,21 +1245,20 @@ void MainWindow::onAutoGenerate()
 
     QAction *chosen = menu.exec(m_autoGenBtn->mapToGlobal(QPoint(0, m_autoGenBtn->height())));
 
-    QList<Track> allTracks = m_library->loadLibrary();
-    if (allTracks.isEmpty()) {
+    if (m_allTracks.isEmpty()) {
         QMessageBox::information(this, "Auto Generate",
                                  "No tracks in library. Scan a folder first.");
         return;
     }
 
     if (chosen == byArtist) {
-        m_playlistManager->generateByArtist(allTracks);
+        m_playlistManager->generateByArtist(m_allTracks);
         statusBar()->showMessage("Generated artist playlists", 3000);
     } else if (chosen == byAlbum) {
-        m_playlistManager->generateByAlbum(allTracks);
+        m_playlistManager->generateByAlbum(m_allTracks);
         statusBar()->showMessage("Generated album playlists", 3000);
     } else if (chosen == byTag) {
-        m_playlistManager->generateByTag(allTracks);
+        m_playlistManager->generateByTag(m_allTracks);
         statusBar()->showMessage("Generated tag playlists", 3000);
     }
 }
@@ -1286,10 +1314,9 @@ void MainWindow::onEditTags()
     if (m_contextTrackPath.isEmpty())
         return;
 
-    // Find the track in the library
-    QList<Track> allTracks = m_library->loadLibrary();
+    // Find the track in the master list
     Track *track = nullptr;
-    for (auto &t : allTracks) {
+    for (auto &t : m_allTracks) {
         if (t.filePath == m_contextTrackPath) {
             track = &t;
             break;
@@ -1318,10 +1345,10 @@ void MainWindow::onEditTags()
     }
     track->tags = tagList;
 
-    // Persist
-    m_library->saveLibrary(allTracks);
+    // Persist master list
+    m_library->saveLibrary(m_allTracks);
 
-    // Also update the in-memory playlist
+    // Also update the in-memory playlist view
     QList<Track> playing = m_playlist->allTracks();
     for (auto &t : playing) {
         if (t.filePath == m_contextTrackPath)
