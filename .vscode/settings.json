@@ -1,6 +1,0 @@
-{
-  // 指向 Qt 的 MinGW 套件目录（用正斜杠，版本号/路径按你的实际安装填）
-  "cmake.configureSettings": {
-    "CMAKE_PREFIX_PATH": "C:/Qt/6.11.1/mingw_64"
-  }
-}

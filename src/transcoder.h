@@ -17,9 +17,12 @@ public:
 
     // Start transcoding. inputFile -> outputFile using ffmpeg.
     // outputFormat: "mp3", "flac", "wav", etc.
+    // bitrateKbps: target audio bitrate in kbps (0 = ffmpeg default).
+    // sampleRateHz: target sample rate in Hz (0 = keep original).
     // Returns false if ffmpeg.exe is not found or inputs are invalid.
     bool start(const QString &inputFile, const QString &outputFile,
-               const QString &outputFormat = "mp3");
+               const QString &outputFormat = "mp3",
+               int bitrateKbps = 0, int sampleRateHz = 0);
 
     // Cancel the current transcode
     void cancel();

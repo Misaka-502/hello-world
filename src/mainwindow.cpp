@@ -20,6 +20,7 @@
 #include <QInputDialog>
 #include <QMenu>
 #include <QMessageBox>
+#include <QTimer>
 #include <QMediaPlayer>
 #include <QMediaMetaData>
 #include <QSettings>
@@ -240,7 +241,7 @@ void MainWindow::setupLeftPanel(QWidget *parent, QHBoxLayout *mainLayout)
 
     // --- Playlist list ---
     m_playlistWidget = new QListWidget(parent);
-    m_playlistWidget->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_playlistWidget->setSelectionMode(QAbstractItemView::ExtendedSelection);
     m_playlistWidget->setObjectName("playlistList");
     m_playlistWidget->setContextMenuPolicy(Qt::CustomContextMenu);
     connect(m_playlistWidget, &QListWidget::customContextMenuRequested,
@@ -801,24 +802,138 @@ void MainWindow::onAddFolder()
 
 void MainWindow::onTranscode()
 {
-    int idx = m_playlist->currentIndex();
-    if (idx < 0) {
-        QMessageBox::information(this, "Convert", "Select a track first.");
+    // Collect selected tracks from playlist (or use all filtered tracks if none selected)
+    QList<Track> selectedTracks;
+    QList<QListWidgetItem *> selItems = m_playlistWidget->selectedItems();
+    QList<Track> filtered = m_playlist->filteredTracks();
+
+    if (!selItems.isEmpty()) {
+        for (auto *item : selItems) {
+            int row = m_playlistWidget->row(item);
+            if (row >= 0 && row < filtered.size())
+                selectedTracks.append(filtered[row]);
+        }
+    } else {
+        // No selection — fall back to the currently playing track
+        int idx = m_playlist->currentIndex();
+        if (idx >= 0 && idx < m_playlist->count())
+            selectedTracks.append(m_playlist->trackAt(idx));
+    }
+
+    if (selectedTracks.isEmpty()) {
+        QMessageBox::information(this, "Convert", "Select one or more tracks first.");
         return;
     }
 
-    const Track &track = m_playlist->trackAt(idx);
+    // --- Build options dialog ---
+    QDialog dlg(this);
+    dlg.setWindowTitle("Batch Convert — " + QString::number(selectedTracks.size()) + " track(s)");
+    dlg.resize(420, 320);
 
-    QString savePath = QFileDialog::getSaveFileName(
-        this, "Save Converted File",
-        QFileInfo(track.filePath).completeBaseName() + ".mp3",
-        "MP3 (*.mp3);;FLAC (*.flac);;WAV (*.wav)");
+    QVBoxLayout *dlgLayout = new QVBoxLayout(&dlg);
+    dlgLayout->setSpacing(10);
 
-    if (savePath.isEmpty())
+    // Format selection
+    QLabel *fmtLabel = new QLabel("Output format:");
+    fmtLabel->setStyleSheet("font-weight: bold;");
+    dlgLayout->addWidget(fmtLabel);
+
+    QComboBox *formatCombo = new QComboBox(&dlg);
+    formatCombo->addItem("MP3 (*.mp3)", "mp3");
+    formatCombo->addItem("FLAC (*.flac)", "flac");
+    formatCombo->addItem("WAV (*.wav)", "wav");
+    formatCombo->setCurrentIndex(0);
+    dlgLayout->addWidget(formatCombo);
+
+    // Bitrate selection (relevant for MP3 mainly)
+    QLabel *brLabel = new QLabel("Bitrate:");
+    brLabel->setStyleSheet("font-weight: bold;");
+    dlgLayout->addWidget(brLabel);
+
+    QComboBox *bitrateCombo = new QComboBox(&dlg);
+    bitrateCombo->addItem("Default (VBR q=2)", 0);
+    bitrateCombo->addItem("128 kbps", 128);
+    bitrateCombo->addItem("192 kbps", 192);
+    bitrateCombo->addItem("256 kbps", 256);
+    bitrateCombo->addItem("320 kbps", 320);
+    bitrateCombo->setCurrentIndex(0);
+    dlgLayout->addWidget(bitrateCombo);
+
+    // Sample rate selection
+    QLabel *srLabel = new QLabel("Sample rate:");
+    srLabel->setStyleSheet("font-weight: bold;");
+    dlgLayout->addWidget(srLabel);
+
+    QComboBox *sampleRateCombo = new QComboBox(&dlg);
+    sampleRateCombo->addItem("Keep original", 0);
+    sampleRateCombo->addItem("44100 Hz", 44100);
+    sampleRateCombo->addItem("48000 Hz", 48000);
+    sampleRateCombo->setCurrentIndex(0);
+    dlgLayout->addWidget(sampleRateCombo);
+
+    // Output directory
+    QLabel *dirLabel = new QLabel("Output directory:");
+    dirLabel->setStyleSheet("font-weight: bold;");
+    dlgLayout->addWidget(dirLabel);
+
+    QWidget *dirRow = new QWidget(&dlg);
+    QHBoxLayout *dirLayout = new QHBoxLayout(dirRow);
+    dirLayout->setContentsMargins(0, 0, 0, 0);
+
+    QLineEdit *dirEdit = new QLineEdit(&dlg);
+    // Default to the first track's directory
+    dirEdit->setText(QFileInfo(selectedTracks.first().filePath).absolutePath());
+    dirEdit->setReadOnly(true);
+    dirLayout->addWidget(dirEdit);
+
+    QPushButton *browseBtn = new QPushButton("Browse...", &dlg);
+    browseBtn->setObjectName("miniBtn");
+    connect(browseBtn, &QPushButton::clicked, [&dirEdit, &dlg]() {
+        QString dir = QFileDialog::getExistingDirectory(&dlg, "Select Output Directory");
+        if (!dir.isEmpty())
+            dirEdit->setText(dir);
+    });
+    dirLayout->addWidget(browseBtn);
+    dlgLayout->addWidget(dirRow);
+
+    // Info label
+    QLabel *infoLabel = new QLabel(
+        QString("%1 file(s) will be converted. Each file keeps its base name.")
+            .arg(selectedTracks.size()));
+    infoLabel->setStyleSheet("color: #909399; font-size: 12px;");
+    infoLabel->setWordWrap(true);
+    dlgLayout->addWidget(infoLabel);
+
+    // Dialog buttons
+    QDialogButtonBox *buttons = new QDialogButtonBox(
+        QDialogButtonBox::Ok | QDialogButtonBox::Cancel, &dlg);
+    buttons->button(QDialogButtonBox::Ok)->setText("Start Convert");
+    connect(buttons, &QDialogButtonBox::accepted, &dlg, &QDialog::accept);
+    connect(buttons, &QDialogButtonBox::rejected, &dlg, &QDialog::reject);
+    dlgLayout->addWidget(buttons);
+
+    if (dlg.exec() != QDialog::Accepted)
         return;
 
-    QString format = QFileInfo(savePath).suffix().toLower();
+    // --- Gather settings ---
+    QString outputDir = dirEdit->text();
+    if (outputDir.isEmpty() || !QFileInfo::exists(outputDir)) {
+        QMessageBox::warning(this, "Convert", "Output directory does not exist.");
+        return;
+    }
 
+    m_batchQueue.clear();
+    for (const auto &t : selectedTracks)
+        m_batchQueue.append(t.filePath);
+
+    m_batchIndex = 0;
+    m_batchTotal = m_batchQueue.size();
+    m_batchOutputDir = outputDir;
+    m_batchFormat = formatCombo->currentData().toString();
+    m_batchBitrate = bitrateCombo->currentData().toInt();
+    m_batchSampleRate = sampleRateCombo->currentData().toInt();
+
+    // Ensure transcoder instance exists
     if (!m_transcoder) {
         m_transcoder = new Transcoder(this);
         connect(m_transcoder, &Transcoder::progressChanged,
@@ -832,28 +947,71 @@ void MainWindow::onTranscode()
         return;
     }
 
-    bool ok = m_transcoder->start(track.filePath, savePath, format);
+    processNextBatchItem();
+}
+
+void MainWindow::processNextBatchItem()
+{
+    if (m_batchQueue.isEmpty()) {
+        // All done
+        statusBar()->showMessage(
+            QString("Batch conversion complete — %1 file(s)").arg(m_batchTotal), 5000);
+        QMessageBox::information(this, "Convert",
+            QString("Batch conversion finished!\n%1 file(s) processed.").arg(m_batchTotal));
+        m_batchTotal = 0;
+        m_batchIndex = 0;
+        return;
+    }
+
+    QString inputFile = m_batchQueue.takeFirst();
+    m_batchIndex++;
+
+    QFileInfo fi(inputFile);
+    QString outputFile = m_batchOutputDir + "/" + fi.completeBaseName() + "." + m_batchFormat;
+
+    // Avoid overwriting the source file
+    if (QFileInfo(outputFile).absoluteFilePath() == QFileInfo(inputFile).absoluteFilePath()) {
+        outputFile = m_batchOutputDir + "/" + fi.completeBaseName() + "_converted." + m_batchFormat;
+    }
+
+    bool ok = m_transcoder->start(inputFile, outputFile, m_batchFormat,
+                                  m_batchBitrate, m_batchSampleRate);
     if (!ok) {
-        statusBar()->showMessage("Failed to start conversion. Is ffmpeg installed?", 5000);
+        statusBar()->showMessage(
+            QString("[%1/%2] Failed to start: %3")
+                .arg(m_batchIndex).arg(m_batchTotal).arg(fi.fileName()), 5000);
+        // Skip to next
+        processNextBatchItem();
     } else {
-        statusBar()->showMessage("Converting...");
+        statusBar()->showMessage(
+            QString("[%1/%2] Converting: %3...")
+                .arg(m_batchIndex).arg(m_batchTotal).arg(fi.fileName()));
     }
 }
 
 void MainWindow::onTranscodeProgress(int percent)
 {
-    statusBar()->showMessage(QString("Converting... %1%").arg(percent));
+    statusBar()->showMessage(
+        QString("[%1/%2] Converting... %3%")
+            .arg(m_batchIndex).arg(m_batchTotal).arg(percent));
 }
 
 void MainWindow::onTranscodeFinished(bool success, const QString &outputFile)
 {
     if (success) {
-        statusBar()->showMessage("Conversion complete: " + outputFile, 5000);
-        QMessageBox::information(this, "Convert", "Conversion complete!\n" + outputFile);
+        statusBar()->showMessage(
+            QString("[%1/%2] Done: %3")
+                .arg(m_batchIndex).arg(m_batchTotal)
+                .arg(QFileInfo(outputFile).fileName()), 3000);
     } else {
-        statusBar()->showMessage("Conversion failed", 5000);
-        QMessageBox::warning(this, "Convert", "Conversion failed.");
+        statusBar()->showMessage(
+            QString("[%1/%2] Failed: %3")
+                .arg(m_batchIndex).arg(m_batchTotal)
+                .arg(QFileInfo(outputFile).fileName()), 5000);
     }
+
+    // Process the next file in the queue
+    QTimer::singleShot(500, this, &MainWindow::processNextBatchItem);
 }
 
 // ============================================================

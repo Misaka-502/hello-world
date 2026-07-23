@@ -77,6 +77,7 @@ private slots:
     void onTranscode();
     void onTranscodeProgress(int percent);
     void onTranscodeFinished(bool success, const QString &outputFile);
+    void processNextBatchItem();
 
     // Karaoke toggle
     void onToggleKaraoke();
@@ -164,6 +165,15 @@ private:
     qint64 m_currentDuration = 0;
     QString m_contextTrackPath;  // for right-click context menu
     QList<Track> m_allTracks;    // full library — always the master copy, saved to disk
+
+    // --- Batch transcode state ---
+    QStringList m_batchQueue;     // input file paths remaining to convert
+    int m_batchIndex = 0;        // 1-based index of current file
+    int m_batchTotal = 0;        // total files in batch
+    QString m_batchOutputDir;    // output directory for batch
+    QString m_batchFormat;       // output format for batch
+    int m_batchBitrate = 0;      // bitrate in kbps (0 = default)
+    int m_batchSampleRate = 0;   // sample rate in Hz (0 = keep original)
 };
 
 #endif // MAINWINDOW_H

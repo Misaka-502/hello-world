@@ -23,7 +23,8 @@ Transcoder::~Transcoder()
 }
 
 bool Transcoder::start(const QString &inputFile, const QString &outputFile,
-                        const QString &outputFormat)
+                        const QString &outputFormat,
+                        int bitrateKbps, int sampleRateHz)
 {
     if (!QFileInfo::exists(inputFile))
         return false;
@@ -40,15 +41,30 @@ bool Transcoder::start(const QString &inputFile, const QString &outputFile,
 
     // Codec selection based on format
     if (outputFormat == "mp3") {
-        args << "-codec:a" << "libmp3lame" << "-q:a" << "2";
+        args << "-codec:a" << "libmp3lame";
+        // Use bitrate-based VBR (‑q:a is ignored when ‑b:a is set)
+        if (bitrateKbps > 0)
+            args << "-b:a" << QString("%1k").arg(bitrateKbps);
+        else
+            args << "-q:a" << "2";   // default quality
     } else if (outputFormat == "flac") {
         args << "-codec:a" << "flac";
+        // FLAC is lossless; bitrate flag controls compression level indirectly
+        if (bitrateKbps > 0)
+            args << "-compression_level" << "8";
     } else if (outputFormat == "wav") {
         args << "-codec:a" << "pcm_s16le";
+        // WAV is uncompressed; bitrate is ignored
     } else {
         // Default: let ffmpeg choose
         args << "-codec:a" << "libmp3lame";
+        if (bitrateKbps > 0)
+            args << "-b:a" << QString("%1k").arg(bitrateKbps);
     }
+
+    // Sample rate
+    if (sampleRateHz > 0)
+        args << "-ar" << QString::number(sampleRateHz);
 
     args << outputFile;
 
